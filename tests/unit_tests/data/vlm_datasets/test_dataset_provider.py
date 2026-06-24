@@ -23,6 +23,7 @@ class _DummyTokenizer:
     pad_token = "<pad>"
     eos_token_id = 2
     added_tokens_decoder = {}
+    chat_template = "{% generation %}{{ messages }}{% endgeneration %}"
 
     def __call__(self, text, add_special_tokens=False):
         # Very small deterministic tokenization
@@ -34,11 +35,15 @@ class _DummyTokenizer:
 
 
 class Gemma3Processor:
+    chat_template = "{% generation %}{{ messages }}{% endgeneration %}"
+
     def __init__(self):
         self.tokenizer = _DummyTokenizer()
 
     def apply_chat_template(self, conversation, tokenize=False, **kwargs):
         if tokenize:
+            if kwargs.get("return_assistant_tokens_mask"):
+                return {"input_ids": [1, 2, 3], "assistant_masks": [0, 0, 0]}
             # Return minimal dict used by gemma3_vl_collate_fn
             input_ids = torch.tensor([[1, 2, 3]])
             pixel_values = torch.randn(1, 1, 3, 4, 4)
@@ -60,6 +65,10 @@ class Gemma3Processor:
 
 def _example():
     return {"conversation": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}
+
+
+def _packable_collate(examples, processor, *, pack_sequences=False):
+    return {"pack_sequences": pack_sequences}
 
 
 def test_vlm_conversation_dataset_basic():
@@ -116,3 +125,55 @@ def test_hf_provider_builds_splits_and_binds_collate(monkeypatch):
     # Ensure collate_fn is bound and callable
     batch = train_ds.collate_fn([_example()])
     assert isinstance(batch, dict)
+
+
+def test_hf_provider_keeps_runtime_packing_out_of_conversation_dataset(monkeypatch):
+    import transformers
+
+    from megatron.bridge.data.vlm_datasets import hf_provider as dp_mod
+
+    monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", staticmethod(lambda *a, **k: Gemma3Processor()))
+
+    def _fake_get_maker(self):
+        return lambda **kwargs: [_example(), _example()]
+
+    monkeypatch.setattr(dp_mod.HFDatasetConversationProvider, "_get_maker", _fake_get_maker)
+
+    provider = dp_mod.HFDatasetConversationProvider(
+        seq_length=16,
+        hf_processor_path="dummy/model",
+        maker_name="rdr",
+        pack_sequences_in_batch=True,
+    )
+
+    ctx = DatasetBuildContext(train_samples=2, valid_samples=0, test_samples=0)
+    train_ds, _, _ = provider.build_datasets(ctx)
+
+    assert train_ds is not None and len(train_ds) == 2
+
+
+def test_hf_provider_forwards_packing_to_supported_collate(monkeypatch):
+    import transformers
+
+    from megatron.bridge.data.vlm_datasets import hf_provider as dp_mod
+
+    monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", staticmethod(lambda *a, **k: Gemma3Processor()))
+
+    def _fake_get_maker(self):
+        return lambda **kwargs: [_example(), _example()]
+
+    monkeypatch.setattr(dp_mod.HFDatasetConversationProvider, "_get_maker", _fake_get_maker)
+
+    provider = dp_mod.HFDatasetConversationProvider(
+        seq_length=16,
+        hf_processor_path="dummy/model",
+        maker_name="rdr",
+        collate_impl=_packable_collate,
+        pack_sequences_in_batch=True,
+    )
+
+    ctx = DatasetBuildContext(train_samples=2, valid_samples=0, test_samples=0)
+    train_ds, _, _ = provider.build_datasets(ctx)
+
+    assert train_ds is not None
+    assert train_ds.collate_fn([_example()])["pack_sequences"] is True
