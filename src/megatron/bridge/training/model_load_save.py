@@ -27,8 +27,8 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.utils import get_model_config
+from megatron.training.models.base import ModelConfig
 
-from megatron.bridge.models.common import ModelConfig
 from megatron.bridge.models.model_provider import ModelParallelKwargs, ModelProviderMixin
 from megatron.bridge.training.checkpointing import save_checkpoint
 from megatron.bridge.training.config import CheckpointConfig, ConfigContainer, LoggerConfig
@@ -198,6 +198,11 @@ def load_tokenizer(checkpoint_path: str, **kwargs) -> MegatronTokenizer:
     else:
         cfg = _tokenizer_config_from_args(mlm_args)
 
+    hf_tokenizer_kwargs = kwargs.get("hf_tokenizer_kwargs")
+    caller_trusts_remote_code = kwargs.get("trust_remote_code") is True or (
+        isinstance(hf_tokenizer_kwargs, dict) and hf_tokenizer_kwargs.get("trust_remote_code") is True
+    )
+
     for key, val in kwargs.items():
         if hasattr(cfg, key):
             setattr(cfg, key, val)
@@ -205,6 +210,12 @@ def load_tokenizer(checkpoint_path: str, **kwargs) -> MegatronTokenizer:
             raise AttributeError(
                 f"Attempting to set a non-existent attribute '{key}' on TokenizerConfig.\nState of TokenizerConfig before attempting this override: {cfg}"
             )
+
+    if getattr(cfg, "trust_remote_code", False) is True and not caller_trusts_remote_code:
+        raise ValueError(
+            "Checkpoint tokenizer config requested trust_remote_code=True. "
+            "Pass trust_remote_code=True to load_tokenizer() only if you trust the checkpoint tokenizer code."
+        )
 
     if cfg.tokenizer_type in HF_BASED_TOKENIZERS and cfg.tokenizer_model == Path():
         cfg.tokenizer_model = Path(checkpoint_path) / "tokenizer"
